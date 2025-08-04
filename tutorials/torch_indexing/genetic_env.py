@@ -11,6 +11,7 @@ import numpy as np
 
 # Rendering
 import matplotlib.pyplot as plt
+from matplotlib.patches import Arc, FancyArrowPatch
 import imageio
 
 
@@ -173,9 +174,14 @@ class TorchPendulum(Simulator):
         self.m = 1.0
         self.l = 1.0
         self.start_angle=15 * 2 * np.pi / 360  # 15 degrees in radians
+        self.friction = 0.05
         # For rendering
-        self.fig, self.ax = None, None
-        self.length = self.l  # rod length for drawing
+        self.fig = None
+        self.ax = None
+        self.length = self.l
+        self.origin = (0, 0.3)
+        self.arrow_base_offset = 1.2  # vertical offset for torque arrow
+        self.arrow = None
 
     @property
     def weight_size(self):
@@ -184,26 +190,24 @@ class TorchPendulum(Simulator):
     def _physics_step(self, state, torque):
         theta, theta_dot = state[:, 0], state[:, 1]
         # Discretization of \ddot{\theta} = -\frac{g}{l} \sin(\theta) + \dfrac{\tau}{m l^2} 
-        new_theta_dot = theta_dot + self.dt *  ( - self.g / self.l * torch.sin(theta) + torque / (self.m * self.l**2))
+        new_theta_dot = theta_dot + self.dt *  ( - self.g / self.l * torch.sin(theta) + torque / (self.m * self.l**2)) \
+                        - self.friction * theta_dot * self.dt
+
         new_theta_dot = torch.clamp(new_theta_dot, -self.max_speed, self.max_speed)
         new_theta = theta + new_theta_dot * self.dt
         return torch.stack((new_theta, new_theta_dot), dim=1)
 
 
-    def evaluate(self, weights, max_steps=300):
+    def evaluate(self, weights, max_steps=400):
         batch_size = weights.shape[0]
         weights = weights.to(self.device)
 
-        # Layer 1: matrix (2,20) = 40 weights
+        # Layer weights
         matrix1 = weights[:, :40].reshape(batch_size, 2, 20)
-
-        # Layer 2: matrix (20,10) = 200 weights
         matrix2 = weights[:, 40:240].reshape(batch_size, 20, 10)
+        last_layer = weights[:, 240:]
 
-        # Output layer: matrix (10,1) = 10 weights
-        last_layer = weights[:, 240:]  # shape: (batch_size, 10)
-
-        # Initial state: start angle and zero velocity
+        # Initial state
         theta = torch.full((batch_size,), self.start_angle, device=self.device)
         theta_dot = torch.zeros(batch_size, device=self.device)
         state = torch.stack((theta, theta_dot), dim=1)
@@ -211,42 +215,34 @@ class TorchPendulum(Simulator):
         total_reward = torch.zeros(batch_size, device=self.device)
 
         for i in range(max_steps):
-            # Forward pass:
-            hidden1 = torch.relu(torch.bmm(state.unsqueeze(1), matrix1).squeeze(1))  # (batch, 20)
-            hidden2 = torch.relu(torch.bmm(hidden1.unsqueeze(1), matrix2).squeeze(1))  # (batch, 10)
-            
-            torque = torch.sum(hidden2 * last_layer, dim=1)  # (batch,)
+            # Forward pass
+            hidden1 = torch.relu(torch.bmm(state.unsqueeze(1), matrix1).squeeze(1))
+            hidden2 = torch.relu(torch.bmm(hidden1.unsqueeze(1), matrix2).squeeze(1))
+            torque = torch.sum(hidden2 * last_layer, dim=1)
             torque = torch.tanh(torque) * self.max_torque
 
-            # Step physics forward
+            # Physics update
             state = self._physics_step(state, torque)
             theta, theta_dot = state[:, 0], state[:, 1]
 
-            # Normalize angle to [-1, 1]
+            # Normalize angle
             norm_theta = ((theta % (2 * torch.pi)) - torch.pi) / torch.pi
+            reward = -  (norm_theta ** 2 + 0.1 * (torque / self.max_torque)**2)
 
-            # Compute reward
-            #reward = -(norm_theta ** 2
-            #        + 0.1 * (theta_dot / self.max_speed) ** 2
-            #        + 0.001 * (torque / self.max_torque) ** 2)
-            reward = - i/max_steps * norm_theta ** 2
-
+            # Accumulate reward
             total_reward += reward
+
 
         return total_reward
 
 
-    def record_run(self, weights, max_steps=300, video_path="pendulum_run.mp4"):
+    def record_run(self, weights, max_steps=400, video_path="pendulum_run.mp4"):
         import imageio
         self._setup_render()
 
         weights = weights.to(self.device).unsqueeze(0)
-
-        # Layer 1: matrix (2,20) = 40 weights
         matrix1 = weights[:, :40].reshape(-1, 2, 20)
-        # Layer 2: matrix (20,10) = 200 weights
         matrix2 = weights[:, 40:240].reshape(-1, 20, 10)
-        # Output layer: matrix (10,1) = 10 weights
         last_layer = weights[:, 240:]
 
         theta = torch.full((1,), self.start_angle, device=self.device)
@@ -254,7 +250,6 @@ class TorchPendulum(Simulator):
         state = torch.stack((theta, theta_dot), dim=1)
 
         frames = []
-
         for _ in range(max_steps):
             hidden1 = torch.relu(torch.bmm(state.unsqueeze(1), matrix1).squeeze(1))
             hidden2 = torch.relu(torch.bmm(hidden1.unsqueeze(1), matrix2).squeeze(1))
@@ -263,56 +258,57 @@ class TorchPendulum(Simulator):
             torque = torch.tanh(torque) * self.max_torque
 
             state = self._physics_step(state, torque)
-
             theta = state[0, 0].item()
-            frame = self._render_frame(theta)
+            frame = self._render_frame(theta, torque.item())
             frames.append(frame)
 
-        imageio.mimsave(video_path, frames, fps=int(1 / self.dt))
+        imageio.mimsave(video_path, frames, fps=int(1 / self.dt), macro_block_size=1)
         plt.close(self.fig)
-
 
     def _setup_render(self):
         plt.ioff()
         self.fig, self.ax = plt.subplots(figsize=(5,5))
-        self.ax.set_xlim(-2, 2)
-        self.ax.set_ylim(-2, 2)
+        self.ax.set_xlim(-2,2)
+        self.ax.set_ylim(-2,2)
         self.ax.set_aspect('equal')
         self.ax.axis('off')
-
-        # Bigger pivot node above the rod
-        self.origin_y_offset = 0.3  # offset above origin to draw the pivot node higher
-
+        # draw pivot node
+        self.ax.add_patch(plt.Circle(self.origin, 0.1, color='k', zorder=5))
+        # create line handle
         self.line, = self.ax.plot([], [], lw=4, color='r')
-        self.node = plt.Circle((0, self.origin_y_offset), 0.1, color='k', zorder=5)
-        self.ax.add_patch(self.node)
+        # placeholder for arrow
+        self.arrow = None
 
-    def _render_frame(self, theta):
-        theta_t = torch.tensor(theta, device=self.device)
-
-        x_start, y_start = 0, self.origin_y_offset
-
-        # Rod end position:
-        x_end = x_start + self.length * torch.sin(theta_t).item()
-        y_end = y_start - self.length * torch.cos(theta_t).item()
-
-        self.line.set_data([x_start, x_end], [y_start, y_end])
+    def _render_frame(self, theta, torque):
+        # pendulum
+        x0, y0 = self.origin
+        x1 = x0 + self.length * np.sin(theta)
+        y1 = y0 - self.length * np.cos(theta)
+        self.line.set_data([x0, x1], [y0, y1])
+        # remove old arrow
+        if self.arrow:
+            self.arrow.remove()
+        # draw torque arrow below pivot
+        direction = np.sign(torque)
+        magnitude = abs(torque)/self.max_torque
+        max_len = 0.8
+        dx = direction * max_len * magnitude
+        dy = 0
+        ax = self.ax
+        self.arrow = ax.arrow(
+            x0, y0 - self.arrow_base_offset,
+            dx, dy,
+            head_width=0.1, head_length=0.1,
+            length_includes_head=True,
+            color='blue'
+        )
+        # finalize
         self.fig.canvas.draw()
-
         buf = np.frombuffer(self.fig.canvas.tostring_argb(), dtype=np.uint8)
-        w, h = self.fig.canvas.get_width_height()
+        w,h = self.fig.canvas.get_width_height()
         buf.shape = (h, w, 4)
-
-        # Convert ARGB to RGBA
-        buf = buf[:, :, [1, 2, 3, 0]]
-
-        rgb_buf = buf[:, :, :3].copy()
-
-        return rgb_buf
-
-    
-
-
+        buf = buf[:,:, [1,2,3,0]]
+        return buf[:,:,:3].copy()
 
 
 def try_cartpole():
